@@ -986,7 +986,7 @@ type Commands<'analyzer> (serialize : Serializer, backgroundServiceEnabled) =
             let checker : FSharpChecker = checker.GetFSharpChecker()
             // ENHANCEMENT: consider caching the Fantomas configuration and reevaluate when the configuration file changes.
             let config =
-                match Fantomas.CodeFormatter.TryReadConfiguration filePath with
+                match Fantomas.Extras.EditorConfig.tryReadConfiguration filePath with
                 | Some c -> c
                 | None ->
                   fantomasLogger.warn (Log.setMessage "No fantomas configuration found for file '{filePath}' or parent directories. Using the default configuration." >> Log.addContextDestructured "filePath" file)
@@ -1023,3 +1023,71 @@ type Commands<'analyzer> (serialize : Serializer, backgroundServiceEnabled) =
     member __.SetLinterConfigRelativePath (relativePath: string option) =
       linterConfigFileRelativePath <- relativePath
       linterConfiguration <- Lint.loadConfiguration workspaceRoot linterConfigFileRelativePath
+
+
+    member __.FSharpLiterate (file: SourceFilePath) =
+      let file = Path.GetFullPath file
+      async {
+        let cnt =
+          match state.TryGetFileSource file with
+          | Ok ctn -> String.concat "\n" ctn
+          | _ ->  File.ReadAllText file
+        let parsedFile =
+          if Utils.isAScript file then
+            FSharp.Formatting.Literate.Literate.ParseScriptString cnt
+          else
+             FSharp.Formatting.Literate.Literate.ParseMarkdownString cnt
+
+        let html =  FSharp.Formatting.Literate.Literate.ToHtml parsedFile
+        return CoreResponse.Res html
+      }
+
+    member __.PipelineHints (tyRes : ParseAndCheckResults) =
+      let file = Path.GetFullPath tyRes.FileName
+      async {
+        match state.TryGetFileSource file with
+        | Ok ctn ->
+
+          let getGenerics line (token: FSharpTokenInfo) =
+            async {
+              let lineStr = ctn.[line]
+              let! res = tyRes.TryGetToolTip (Pos.fromZ line token.RightColumn) lineStr
+              return
+                match res with
+                | Ok tip ->
+                  TipFormatter.extractGenerics tip
+                | _ ->
+                  commandsLogger.info (Log.setMessage "ParameterHints - No tooltips for token: '{token}'\n Line: \n{line}" >> Log.addContextDestructured "token" token >> Log.addContextDestructured "line" lineStr)
+                  []
+            }
+
+          let! hints =
+            ctn
+            |> Array.map (Lexer.tokenizeLine [||])
+            |> Array.pairwise
+            |> Array.mapi (fun currentIndex (currentTokens, nextTokens) -> currentIndex, currentTokens, nextTokens)
+            |> Array.choose (fun (id, tok, nextTok) ->
+                match nextTok with
+                | x::y::xs when x.TokenName.ToUpper() = "WHITESPACE" && y.TokenName.ToUpper() = "INFIX_BAR_OP" ->
+                  Some (async {
+                    let! gens = getGenerics (id + 1) y
+                    return (id, gens)
+                  })
+                | y::xs when y.TokenName.ToUpper() = "INFIX_BAR_OP" ->
+                  Some (async {
+                    let! gens = getGenerics (id + 1) y
+                    return  (id, gens)
+                  })
+                | _ ->
+                  None
+
+            )
+            |> Async.Parallel
+          return CoreResponse.Res hints
+
+        | _ ->
+          return CoreResponse.InfoRes "Couldn't find file content"
+
+
+      }
+

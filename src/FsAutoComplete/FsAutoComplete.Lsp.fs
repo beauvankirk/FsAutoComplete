@@ -17,9 +17,7 @@ open System.IO
 
 module FcsRange = FSharp.Compiler.Range
 
-#if ANALYZER_SUPPORT
 open FSharp.Analyzers
-#endif
 
 type FSharpLspClient(sendServerRequest: ClientNotificationSender) =
     inherit LspClient ()
@@ -51,11 +49,7 @@ type FSharpLspClient(sendServerRequest: ClientNotificationSender) =
     // TODO: Implement requests
 
 type Commands =
-#if ANALYZER_SUPPORT
   Commands<SDK.Message>
-#else
-  Commands<obj>
-#endif
 
 type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
     inherit LspServer()
@@ -78,7 +72,6 @@ type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
         commands.SetDotnetSDKRoot config.DotNetRoot
         commands.SetFSIAdditionalArguments [| yield! config.FSICompilerToolLocations |> Array.map toCompilerToolArgument; yield! config.FSIExtraParameters |]
         commands.SetLinterConfigRelativePath config.LinterConfig
-#if ANALYZER_SUPPORT
         match config.AnalyzersPath with
         | [||] ->
           Loggers.analyzers.info(Log.setMessage "Analyzers unregistered")
@@ -89,7 +82,7 @@ type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
             Loggers.analyzers.info(Log.setMessage "Registered {count} analyzers from {path}" >> Log.addContextDestructured "count" newlyFound >> Log.addContextDestructured "path" path)
           let total = SDK.Client.registeredAnalyzers.Count
           Loggers.analyzers.info(Log.setMessage "{count} Analyzers registered overall" >> Log.addContextDestructured "count" total)
-#endif
+
 
     //TODO: Thread safe version
     let fixes = System.Collections.Generic.Dictionary<DocumentUri, (LanguageServerProtocol.Types.Range * TextEdit) list>()
@@ -311,7 +304,7 @@ type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
                     |> lspClient.TextDocumentPublishDiagnostics
                     |> Async.Start
                 | NotificationEvent.AnalyzerMessage(messages, file) ->
-#if ANALYZER_SUPPORT
+
                     let uri = Path.FilePathToUri file
                     diagnosticCollections.AddOrUpdate((uri, "F# Analyzers"), [||], fun _ _ -> [||]) |> ignore
                     let fs =
@@ -345,9 +338,6 @@ type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
                         )
                     diagnosticCollections.AddOrUpdate((uri, "F# Analyzers"), diag, fun _ _ -> diag) |> ignore
                     sendDiagnostics uri
-#else
-                    ()
-#endif
             with
             | _ -> ()
         ) |> subscriptions.Add
@@ -421,6 +411,38 @@ type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
                         AsyncLspResult.internalError e.Message
         }
 
+    ///Helper function for handling file requests using **recent** type check results
+    member x.fileHandler<'a> (f: SourceFilePath -> ParseAndCheckResults -> string [] -> AsyncLspResult<'a>) (file: SourceFilePath) : AsyncLspResult<'a> =
+        async {
+
+            // logger.info (Log.setMessage "PositionHandler - Position request: {file} at {pos}" >> Log.addContextDestructured "file" file >> Log.addContextDestructured "pos" pos)
+
+            return!
+                match commands.TryGetFileCheckerOptionsWithLines(file) with
+                | ResultOrString.Error s ->
+                    logger.error (Log.setMessage "FileHandler - Getting file checker options for {file} failed" >> Log.addContextDestructured "error" s >> Log.addContextDestructured "file" file)
+                    AsyncLspResult.internalError s
+                | ResultOrString.Ok (options, lines) ->
+                    try
+                        let tyResOpt = commands.TryGetRecentTypeCheckResultsForFile(file, options)
+                        match tyResOpt with
+                        | None ->
+                            logger.info (Log.setMessage "FileHandler - Cached typecheck results not yet available for {file}" >> Log.addContextDestructured "file" file)
+                            AsyncLspResult.internalError "Cached typecheck results not yet available"
+                        | Some tyRes ->
+                            async {
+                                let! r = Async.Catch (f file tyRes lines)
+                                match r with
+                                | Choice1Of2 r -> return r
+                                | Choice2Of2 e ->
+                                    logger.error (Log.setMessage "FileHandler - Failed during child operation on file {file}" >> Log.addContextDestructured "file" file >> Log.addExn e)
+                                    return LspResult.internalError e.Message
+                            }
+                    with e ->
+                        logger.error (Log.setMessage "FileHandler - Operation failed for file {file}" >> Log.addContextDestructured "file" file >> Log.addExn e)
+                        AsyncLspResult.internalError e.Message
+        }
+
 
     override __.Initialize(p: InitializeParams) = async {
         logger.info (Log.setMessage "Initialize Request")
@@ -437,7 +459,6 @@ type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
         glyphToCompletionKind <- glyphToCompletionKindGenerator clientCapabilities
         glyphToSymbolKind <- glyphToSymbolKindGenerator clientCapabilities
 
-#if ANALYZER_SUPPORT
         let analyzerHandler (file, content, pt, tast, symbols, getAllEnts) =
           let ctx : SDK.Context = {
             FileName = file
@@ -476,7 +497,6 @@ type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
                                     >> Log.addContextDestructured "file" file)
             [||]
         commands.AnalyzerHandler <- Some analyzerHandler
-#endif
         let c =
             p.InitializationOptions
             |> Option.bind (fun options -> if options.HasValues then Some options else None)
@@ -911,7 +931,7 @@ type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
                     | CoreResponse.InfoRes msg | CoreResponse.ErrorRes msg ->
                         LspResult.internalError msg
                     | CoreResponse.Res r ->
-                        fcsRangeToLspLocation r
+                        findDeclToLspLocation r
                         |> GotoResult.Single
                         |> Some
                         |> success
@@ -1170,7 +1190,7 @@ type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
         )
 
     member private x.GetLinterCodeAction fn p =
-        p |> x.IfDiagnostic "Lint:" (fun d ->
+        p |> x.IfDiagnosticType "F# Linter" (fun d ->
             let uri = Path.FilePathToUri fn
 
             match fixes.TryGetValue uri with
@@ -1941,7 +1961,6 @@ type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
     member __.LoadAnalyzers(path) = async {
         logger.info (Log.setMessage "LoadAnalyzers Request: {parms}" >> Log.addContextDestructured "parms" path )
 
-#if ANALYZER_SUPPORT
         try
             if config.EnableAnalyzers then
 
@@ -1968,9 +1987,6 @@ type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
         | ex ->
             Loggers.analyzers.error (Log.setMessage "Loading failed" >> Log.addExn ex)
             return LspResult.success ()
-#else
-        return LspResult.success ()
-#endif
     }
 
     member __.GetHighlighting(p : HighlightingRequest) = async {
@@ -1993,6 +2009,43 @@ type FsharpLspServer(commands: Commands, lspClient: FSharpLspClient) =
     }
 
     member __.ScriptFileProjectOptions = commands.ScriptFileProjectOptions
+
+    member __.FSharpLiterate (p: FSharpLiterateRequest) = async {
+      logger.info (Log.setMessage "FSharpLiterate Request: {parms}" >> Log.addContextDestructured "parms" p )
+
+      let fn = p.FileName
+      let! res = commands.FSharpLiterate fn
+      let res =
+        match res with
+        | CoreResponse.InfoRes msg | CoreResponse.ErrorRes msg ->
+            LspResult.internalError msg
+        | CoreResponse.Res (res) ->
+            { Content = CommandResponse.fsharpLiterate FsAutoComplete.JsonSerializer.writeJson res }
+            |> success
+
+      return res
+    }
+
+    member x.FSharpPipelineHints (p: FSharpPipelineHintRequest) = async {
+      logger.info (Log.setMessage "FSharpPipelineHints Request: {parms}" >> Log.addContextDestructured "parms" p )
+      let fn = p.FileName
+      let res =
+        fn |> x.fileHandler (fun fn tyRes lines ->
+          async {
+            let! res = commands.PipelineHints tyRes
+            let r =
+              match res with
+              | CoreResponse.InfoRes msg | CoreResponse.ErrorRes msg ->
+                LspResult.internalError msg
+              | CoreResponse.Res (res) ->
+                { Content = CommandResponse.pipelineHint FsAutoComplete.JsonSerializer.writeJson res }
+                |> success
+
+            return r
+          }
+        )
+      return! res
+    }
 
 let startCore (commands: Commands) =
     use input = Console.OpenStandardInput()
@@ -2017,6 +2070,8 @@ let startCore (commands: Commands) =
         |> Map.add "fsharp/documentationSymbol" (requestHandling (fun s p -> s.FSharpDocumentationSymbol(p) ))
         |> Map.add "fsharp/loadAnalyzers" (requestHandling (fun s p -> s.LoadAnalyzers(p) ))
         |> Map.add "fsharp/highlighting" (requestHandling (fun s p -> s.GetHighlighting(p) ))
+        |> Map.add "fsharp/fsharpLiterate" (requestHandling (fun s p -> s.FSharpLiterate(p) ))
+        |> Map.add "fsharp/pipelineHint" (requestHandling (fun s p -> s.FSharpPipelineHints(p) ))
         |> Map.add "fake/listTargets" (requestHandling (fun s p -> s.FakeTargets(p) ))
         |> Map.add "fake/runtimePath" (requestHandling (fun s p -> s.FakeRuntimePath(p) ))
 
